@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Music
+GenericName=Music
+Comment=Play local music, podcasts, and radio
+Exec=music-app %U
+TryExec=music-app
+Icon=io.github.enzui.Music
+Terminal=false
+StartupNotify=true
+StartupWMClass=io.github.enzui.Music
+Categories=AudioVideo;Audio;Player;
+Keywords=music;audio;player;podcast;radio;playlist;
+
+MimeType=audio/mpeg;audio/flac;audio/x-flac;audio/mp4;audio/ogg;audio/opus;audio/x-opus+ogg;audio/x-wav;audio/wav;audio/aac;audio/x-ms-wma;

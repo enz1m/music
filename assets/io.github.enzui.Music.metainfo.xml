@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.enzui.Music</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Music</name>
+  <summary>Play local music, podcasts, and radio</summary>
+  <description>
+    <p>
+      Music is a desktop audio player for a local music library, podcast feeds,
+      and public internet radio stations.
+    </p>
+    <ul>
+      <li>Play local tracks and podcast episodes through the system audio stack.</li>
+      <li>Browse a bounded public radio catalogue and save station favourites.</li>
+      <li>Create playlists and restore the playback queue across restarts.</li>
+      <li>Track play history from confirmed playback completion.</li>
+      <li>Search Spotify and control playback on a Spotify Connect device.</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.enzui.Music.desktop</launchable>
+  <provides>
+    <binary>music-app</binary>
+  </provides>
+  <icon type="stock">io.github.enzui.Music</icon>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <keywords>
+    <keyword>music</keyword>
+    <keyword>audio</keyword>
+    <keyword>player</keyword>
+    <keyword>podcast</keyword>
+    <keyword>radio</keyword>
+    <keyword>playlist</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <developer id="io.github.enzui">
+    <name>enzUI contributors</name>
+  </developer>
+</component>
