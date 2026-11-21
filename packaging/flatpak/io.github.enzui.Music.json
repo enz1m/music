@@ -44,7 +44,7 @@
         {
           "type": "archive",
           "url": "https://github.com/enz1m/music/releases/download/v0.2.0/music-cargo-vendor-0.2.0.tar.xz",
-          "sha256": "de015f664d38ba8c5b154202ad5a98184989ed7fb97b3cbe6ff179e8cd3604ae",
+          "sha256": "ad9042bcec48c2caf4bb580b54929707b57279e63dda182fc8443ea9b9a26ff2",
           "strip-components": 1
         },
         {

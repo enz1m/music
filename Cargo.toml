@@ -20,13 +20,13 @@ center = ["dep:enzui-agent"]
 [dependencies]
 url = "2"
 # Portal and theme-detection D-Bus backends require the Tokio executor.
-iced = { default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "wayland", "wayland-dlopen", "wayland-decorations", "canvas", "svg", "a11y", "tokio"], git = "https://github.com/enz1m/enzim-iced.git", rev = "7a1d747489d779ad55d341ef9dd91cc250004388" }
-iced_renderer = { default-features = false, git = "https://github.com/enz1m/enzim-iced.git", rev = "7a1d747489d779ad55d341ef9dd91cc250004388" }
-enzui-core = { features = ["accesskit"], git = "https://github.com/enz1m/enzui.git", rev = "674bdc3f4d24e800b6c22db6166cca817cc838fe" }
-enzui-services = { features = ["gstreamer", "mpris", "oauth", "secret-service"], git = "https://github.com/enz1m/enzui.git", rev = "674bdc3f4d24e800b6c22db6166cca817cc838fe" }
-enzui-resources = { git = "https://github.com/enz1m/enzui.git", rev = "674bdc3f4d24e800b6c22db6166cca817cc838fe" }
-enzui-theme = { git = "https://github.com/enz1m/enzui.git", rev = "674bdc3f4d24e800b6c22db6166cca817cc838fe" }
-enzui-widgets = { features = ["portal-dbus", "application-dbus"], git = "https://github.com/enz1m/enzui.git", rev = "674bdc3f4d24e800b6c22db6166cca817cc838fe" }
+iced = { default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "thread-pool", "linux-theme-detection", "wayland", "wayland-dlopen", "wayland-decorations", "canvas", "svg", "a11y", "tokio"], git = "https://github.com/enz1m/enzim-iced.git", rev = "e36b07b591661fdb666088fc943cc0b927a2367b" }
+iced_renderer = { default-features = false, git = "https://github.com/enz1m/enzim-iced.git", rev = "e36b07b591661fdb666088fc943cc0b927a2367b" }
+enzui-core = { features = ["accesskit"], git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
+enzui-services = { features = ["gstreamer", "mpris", "oauth", "secret-service"], git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
+enzui-resources = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
+enzui-theme = { git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
+enzui-widgets = { features = ["portal-dbus", "application-dbus"], git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
 quick-xml = "0.41"
 curl = { version = "0.4.50", default-features = false, features = ["ssl"] }
 tokio = { version = "1", features = ["rt"] }
@@ -41,16 +41,16 @@ walkdir = "2"
 fastrand = "2"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-enzui-agent = { features = ["iced-consumer"], optional = true, git = "https://github.com/enz1m/enzui.git", rev = "674bdc3f4d24e800b6c22db6166cca817cc838fe" }
+enzui-agent = { features = ["iced-consumer"], optional = true, git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "5"
 
 [dev-dependencies]
 tempfile = "3"
-enzui-core = { features = ["test-frame"], git = "https://github.com/enz1m/enzui.git", rev = "674bdc3f4d24e800b6c22db6166cca817cc838fe" }
+enzui-core = { features = ["test-frame"], git = "https://github.com/enz1m/enzui.git", tag = "v0.3.0-alpha.1" }
 
-iced_test = { git = "https://github.com/enz1m/enzim-iced.git", rev = "7a1d747489d779ad55d341ef9dd91cc250004388" }
+iced_test = { git = "https://github.com/enz1m/enzim-iced.git", rev = "e36b07b591661fdb666088fc943cc0b927a2367b" }
 
 [patch.crates-io]
 zbus_macros = { git = "https://github.com/enz1m/enzim-zbus.git", rev = "e182645b56d15e637bb6c8144f99ebfa7f900716" }
