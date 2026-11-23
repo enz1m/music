@@ -40,8 +40,8 @@ cargo build --locked
 cargo run --locked
 ```
 
-Dependencies pin a public enzUI revision after [Alpha 0.2](https://github.com/enz1m/enzui/releases/tag/v0.2.0-alpha.1),
-including podcast redirect handling, and its matching public foundation forks.
+Dependencies pin a public enzUI revision after [Alpha 0.3](https://github.com/enz1m/enzui/releases/tag/v0.3.0-alpha.1)
+and its matching public foundation forks.
 No sibling framework checkout is needed.
 Wayland is enabled by default; use `--features x11` for X11.
 Use `cargo build --release --locked` for an optimized binary.

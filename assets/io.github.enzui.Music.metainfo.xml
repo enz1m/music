@@ -40,4 +40,15 @@
   <developer id="io.github.enzui">
     <name>enzUI contributors</name>
   </developer>
+  <url type="homepage">https://github.com/enz1m/music</url>
+  <url type="bugtracker">https://github.com/enz1m/music/issues</url>
+  <releases>
+    <release version="0.2.1" date="2026-11-23">
+      <description>
+        <p>Update enzUI for smoother sidebar transitions, centered view switchers,
+          and nonblocking Wayland presentation discovery.</p>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-11-21"/>
+  </releases>
 </component>
