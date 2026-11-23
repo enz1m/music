@@ -50,9 +50,8 @@
   <releases>
     <release version="0.2.1" date="2026-11-23">
       <description>
-        <p>Update enzUI for smoother sidebar transitions, centered view switchers,
-          and nonblocking Wayland presentation discovery.</p>
-        <p>Limit Flatpak media controls to Music's D-Bus name.</p>
+        <p>Switch between your library and playback views with smoother sidebar transitions and easier-to-find view controls.</p>
+        <p>Use your desktop’s media controls with Music’s own player entry.</p>
       </description>
     </release>
     <release version="0.2.0" date="2026-11-21">
