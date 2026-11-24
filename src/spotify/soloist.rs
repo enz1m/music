@@ -93,6 +93,51 @@ pub fn build_url() -> Option<&'static str> {
     }
 }
 
+const MAX_DOWNLOAD_REDIRECTS: usize = 5;
+
+// Redirects are followed by hand because curl's own follower accepts any protocol.
+fn download_https(url: &str, archive: &Path) -> Result<(), String> {
+    let start_failed = |_| "The download couldn't start.".to_owned();
+    let mut target = url.to_owned();
+    for _ in 0..=MAX_DOWNLOAD_REDIRECTS {
+        let mut file = std::fs::File::create(archive)
+            .map_err(|_| "Music couldn't save the download.".to_owned())?;
+        let mut easy = curl::easy::Easy::new();
+        easy.url(&target).map_err(start_failed)?;
+        easy.fail_on_error(true).map_err(start_failed)?;
+        easy.connect_timeout(Duration::from_secs(10))
+            .map_err(start_failed)?;
+        easy.timeout(Duration::from_secs(300))
+            .map_err(start_failed)?;
+        {
+            let mut transfer = easy.transfer();
+            transfer
+                .write_function(|data| {
+                    use std::io::Write;
+                    Ok(file.write_all(data).map_or(0, |()| data.len()))
+                })
+                .map_err(start_failed)?;
+            transfer
+                .perform()
+                .map_err(|_| "Couldn't download Soloist from Spotify. Check your connection.")?;
+        }
+        let code = easy.response_code().map_err(start_failed)?;
+        if !(300..400).contains(&code) {
+            return Ok(());
+        }
+        let next = easy
+            .redirect_url()
+            .ok()
+            .flatten()
+            .ok_or("Spotify's download server sent a broken link.")?;
+        if !next.starts_with("https://") {
+            return Err("Spotify's download server sent an insecure link.".to_owned());
+        }
+        target = next.to_owned();
+    }
+    Err("Spotify's download server redirected too many times.".to_owned())
+}
+
 /// Download Spotify's build into `paths.bin`, replacing an older one.
 ///
 /// # Errors
@@ -101,30 +146,7 @@ pub fn install(paths: &Paths) -> Result<(), String> {
     let url = build_url().ok_or("Spotify doesn't make Soloist for this kind of computer.")?;
     std::fs::create_dir_all(&paths.bin).map_err(|_| "Music couldn't create its player folder.")?;
     let archive = paths.bin.join("soloist.tar.gz.part");
-    {
-        let mut file = std::fs::File::create(&archive)
-            .map_err(|_| "Music couldn't save the download.".to_owned())?;
-        let mut easy = curl::easy::Easy::new();
-        easy.url(url).map_err(|_| "The download couldn't start.")?;
-        easy.follow_location(true)
-            .map_err(|_| "The download couldn't start.")?;
-        easy.fail_on_error(true)
-            .map_err(|_| "The download couldn't start.")?;
-        easy.connect_timeout(Duration::from_secs(10))
-            .map_err(|_| "The download couldn't start.")?;
-        easy.timeout(Duration::from_secs(300))
-            .map_err(|_| "The download couldn't start.")?;
-        let mut transfer = easy.transfer();
-        transfer
-            .write_function(|data| {
-                use std::io::Write;
-                Ok(file.write_all(data).map_or(0, |()| data.len()))
-            })
-            .map_err(|_| "The download couldn't start.")?;
-        transfer
-            .perform()
-            .map_err(|_| "Couldn't download Soloist from Spotify. Check your connection.")?;
-    }
+    download_https(url, &archive)?;
     let unpack = paths.bin.join("unpack");
     let _ = std::fs::remove_dir_all(&unpack);
     std::fs::create_dir_all(&unpack).map_err(|_| "Music couldn't unpack the download.")?;
