@@ -529,14 +529,21 @@ pub(crate) fn read_local_feed(path: &str) -> Result<Vec<u8>, String> {
     if path.is_empty() {
         return Err("Choose an explicit file:// path to a feed.".into());
     }
-    let file =
-        std::fs::File::open(path).map_err(|_| "Couldn’t read that local feed file.".to_string())?;
-    if file
-        .metadata()
-        .map(|m| m.len())
-        .unwrap_or(MAX_FEED_BYTES + 1)
-        > MAX_FEED_BYTES
-    {
+    let unreadable = || "Couldn’t read that local feed file.".to_string();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // A FIFO or device would block the feed worker; only a regular file is a feed.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    );
+    let file = options.open(path).map_err(|_| unreadable())?;
+    let meta = file.metadata().map_err(|_| unreadable())?;
+    if !meta.is_file() {
+        return Err(unreadable());
+    }
+    if meta.len() > MAX_FEED_BYTES {
         return Err(format!(
             "Feed is larger than the {} MiB limit.",
             MAX_FEED_BYTES / 1024 / 1024
@@ -716,7 +723,14 @@ pub fn import_opml(body: &str) -> Vec<(String, String)> {
         let tag = &after[..end];
         // Only `type="rss"` outlines are subscriptions.
         let is_rss = tag.contains("type=\"rss\"") || tag.contains("type='rss'");
-        if is_rss && let Some(url) = attr_value(tag, "xmlUrl") {
+        // A shared OPML document must not make the app read local files.
+        if is_rss
+            && let Some(url) = attr_value(tag, "xmlUrl")
+            && !url
+                .trim_start()
+                .get(..5)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+        {
             let title = attr_value(tag, "text").unwrap_or_else(|| url.clone());
             out.push((title, url));
         }

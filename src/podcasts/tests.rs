@@ -547,3 +547,36 @@ fn curl_transport_fetches_a_deterministic_local_http_feed() {
     assert_eq!(feed.title, "Test Show");
     assert_eq!(feed.playable_count(), 2);
 }
+
+#[test]
+fn a_local_feed_must_be_a_regular_file_and_opml_cannot_name_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("feed.xml");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(feed_ops::read_local_feed(fifo.to_str().unwrap()).is_err());
+
+    let real = dir.path().join("real.xml");
+    std::fs::write(&real, FIXTURE_RSS).unwrap();
+    let link = dir.path().join("link.xml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(feed_ops::read_local_feed(link.to_str().unwrap()).is_err());
+    assert!(feed_ops::read_local_feed(real.to_str().unwrap()).is_ok());
+
+    let opml = r#"<opml><body>
+        <outline type="rss" text="Local" xmlUrl="FILE:///etc/passwd"/>
+        <outline type="rss" text="Remote" xmlUrl="https://example.com/feed.rss"/>
+    </body></opml>"#;
+    assert_eq!(
+        import_opml(opml),
+        [(
+            "Remote".to_string(),
+            "https://example.com/feed.rss".to_string()
+        )]
+    );
+}
