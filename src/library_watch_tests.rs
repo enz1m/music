@@ -15,7 +15,7 @@ use enzui_core::file_tree_watch::{
 use crate::domain::Track;
 use crate::library_watch::{
     DEBOUNCE, LibraryWatcher, RefusalReason, RootScan, RootScanProvider, ScanCompletion,
-    ScanLimits, scan_root_bounded,
+    ScanLimits, ScanRequest, scan_root_bounded,
 };
 use crate::{Message, MusicApp};
 
@@ -67,7 +67,8 @@ struct StagedScanProvider {
 impl StagedScanProvider {}
 
 impl RootScanProvider for StagedScanProvider {
-    fn scan(&self, root: &Path, generation: u64, _cancelled: &dyn Fn() -> bool) -> RootScan {
+    fn scan(&self, request: &ScanRequest, _cancelled: &dyn Fn() -> bool) -> RootScan {
+        let (root, generation) = (request.root.as_path(), request.generation);
         self.calls
             .lock()
             .unwrap()
@@ -87,6 +88,8 @@ impl RootScanProvider for StagedScanProvider {
             undecodable: Vec::new(),
             directories,
             completion,
+            scope: request.scope.clone(),
+            probed: 0,
         }
     }
 }
@@ -108,6 +111,8 @@ fn install_root_watch(watcher: &mut LibraryWatcher, root: &Path, now: Instant) {
         undecodable: Vec::new(),
         directories: vec![root.to_path_buf()],
         completion: ScanCompletion::Complete,
+        scope: None,
+        probed: 0,
     };
     assert!(watcher.accept_completion(&complete, now));
     watcher.reconcile_watches(root, &complete.directories);
@@ -233,6 +238,7 @@ fn overflow_schedules_a_full_authoritative_rescan() {
     );
     watcher.on_deliveries(&deliveries, now);
     let due = watcher.dispatch_due(now + DEBOUNCE + Duration::from_millis(1));
+    assert!(due.iter().all(|dispatch| dispatch.scope.is_none()));
     assert_eq!(due.len(), 1, "overflow arms one full rescan");
 }
 
@@ -270,6 +276,8 @@ fn a_complete_scan_adds_new_preserves_survivors_and_marks_absent_missing() {
         undecodable: Vec::new(),
         directories: vec![root.clone()],
         completion: ScanCompletion::Complete,
+        scope: None,
+        probed: 0,
     };
     let _ = app.update(Message::RootScanComplete(Box::new(scan)));
 
@@ -333,6 +341,8 @@ fn a_refused_scan_merges_discoveries_but_never_removes() {
         undecodable: Vec::new(),
         directories: vec![root.clone()],
         completion: ScanCompletion::Refused(RefusalReason::Directories),
+        scope: None,
+        probed: 0,
     };
     let _ = app.update(Message::RootScanComplete(Box::new(scan)));
 
@@ -370,6 +380,8 @@ fn a_removed_folder_makes_its_late_completion_inert_through_the_reducer() {
         undecodable: Vec::new(),
         directories: vec![root.clone()],
         completion: ScanCompletion::Complete,
+        scope: None,
+        probed: 0,
     };
     let _ = app.update(Message::RootScanComplete(Box::new(scan)));
 
@@ -435,4 +447,86 @@ fn a_failed_watch_install_retains_the_exact_prior_safe_set() {
         ),
         "a failed install degrades visibly to Partial"
     );
+}
+
+fn write_wav(path: &Path, samples: u32) {
+    let data_len = samples * 2;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&8_000u32.to_le_bytes());
+    bytes.extend_from_slice(&16_000u32.to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data_len.to_le_bytes());
+    bytes.resize(bytes.len() + data_len as usize, 0);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn unchanged_files_are_reused_from_the_scan_index_across_runs() {
+    use crate::library_watch::FilesystemScanProvider;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("Music");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    write_wav(&root.join("a.wav"), 800);
+    write_wav(&root.join("b.wav"), 800);
+    write_wav(&root.join("sub/c.wav"), 800);
+    let index = dir.path().join("library-index.json");
+    let request = |scope: Option<Vec<PathBuf>>| ScanRequest {
+        root: root.clone(),
+        generation: 1,
+        scope,
+        manual: false,
+    };
+    let scan = |provider: &FilesystemScanProvider, scope| {
+        let scan = provider.scan(&request(scope), &|| false);
+        assert_eq!(scan.completion, ScanCompletion::Complete);
+        scan
+    };
+
+    let provider = FilesystemScanProvider::persistent(index.clone());
+    assert_eq!(scan(&provider, None).probed, 3);
+    let reused = scan(&provider, None);
+    assert_eq!((reused.probed, reused.tracks.len()), (0, 3));
+
+    write_wav(&root.join("b.wav"), 1_600);
+    let relaunched = FilesystemScanProvider::persistent(index);
+    let changed = scan(&relaunched, None);
+    assert_eq!((changed.probed, changed.tracks.len()), (1, 3));
+
+    std::fs::remove_file(root.join("sub/c.wav")).unwrap();
+    let folder = scan(&relaunched, Some(vec![root.join("sub")]));
+    assert!(folder.tracks.is_empty());
+    assert!(folder.covers(&root.join("sub/c.wav")));
+    assert!(!folder.covers(&root.join("a.wav")));
+}
+
+#[test]
+fn a_change_in_one_folder_rescans_only_that_folder() {
+    let root = PathBuf::from("/music/scoped");
+    let backend = Arc::new(InMemoryDirectoryBackend::new());
+    let mut watcher = LibraryWatcher::with_parts(
+        backend.clone(),
+        Arc::new(StagedScanProvider::default()),
+        owner(),
+    );
+    let now = Instant::now();
+    install_root_watch(&mut watcher, &root, now);
+    watcher.reconcile_watches(&root, &[root.clone(), root.join("album")]);
+
+    backend.emit(
+        &root.join("album"),
+        RawEventKind::Change(DirectoryChange::Created(root.join("album/new.mp3"))),
+    );
+    let deliveries = watcher.service().take_deliveries();
+    watcher.on_deliveries(&deliveries, now);
+    let due = watcher.dispatch_due(now + DEBOUNCE + Duration::from_millis(1));
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].scope, Some(vec![root.join("album")]));
 }

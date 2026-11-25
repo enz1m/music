@@ -36,6 +36,7 @@ mod reduce_batch2;
 mod reduce_batch3;
 #[path = "app_parts/reduce_batch4.rs"]
 mod reduce_batch4;
+mod scan_index;
 mod scanner;
 mod shortcuts;
 mod spotify;

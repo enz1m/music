@@ -52,6 +52,8 @@ fn complete_scan(root: &std::path::Path, generation: u64, tracks: Vec<Track>) ->
         undecodable: Vec::new(),
         directories: vec![root.to_path_buf()],
         completion: ScanCompletion::Complete,
+        scope: None,
+        probed: 0,
     }
 }
 
@@ -381,5 +383,40 @@ fn a_stale_rescan_cannot_transfer_availability() {
     assert!(
         app.library.tracks.contains_key(&id),
         "the stale scan mutates nothing"
+    );
+}
+
+#[test]
+fn a_folder_rescan_classifies_absence_only_inside_that_folder() {
+    let root = PathBuf::from("/music/lib");
+    let (mut app, generation) = app_with_root(&root);
+    let outside = app.library.add_track(track("/music/lib/a.mp3", "A"));
+    let inside = app.library.add_track(track("/music/lib/sub/b.mp3", "B"));
+    app.library.reindex();
+    let scan = complete_scan(
+        &root,
+        generation,
+        vec![
+            track("/music/lib/a.mp3", "A"),
+            track("/music/lib/sub/b.mp3", "B"),
+        ],
+    );
+    let _ = app.update(Message::RootScanComplete(Box::new(scan)));
+
+    let now = std::time::Instant::now();
+    app.library_watch.request_rescan(root.clone(), now);
+    let g = app.library_watch.dispatch_due(now)[0].generation;
+    let scan = RootScan {
+        scope: Some(vec![root.join("sub")]),
+        ..complete_scan(&root, g, Vec::new())
+    };
+    let _ = app.update(Message::RootScanComplete(Box::new(scan)));
+    assert_eq!(
+        app.library.availability_of(outside),
+        TrackAvailability::Present
+    );
+    assert_eq!(
+        app.library.availability_of(inside),
+        TrackAvailability::Missing
     );
 }

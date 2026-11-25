@@ -13,10 +13,14 @@
 //! A file with no picture and no sidecar yields `None`, and views draw the
 //! themed placeholder rather than a stock image.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+
+use serde::{Deserialize, Serialize};
 
 use enzui_core::decode_limits::DecodeLimits;
 use enzui_resources::decode_static;
@@ -59,7 +63,7 @@ pub const REMOTE_COVER_DECODE_LIMITS: DecodeLimits = DecodeLimits {
 
 /// Where a cover came from: embedded in the file or found beside it, which
 /// are different claims about the user's library.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CoverSource {
     /// A picture frame embedded in the audio file's tags (ID3 `APIC`, …).
     Embedded,
@@ -73,7 +77,7 @@ pub enum CoverSource {
 /// the renderer at one uploaded texture.
 #[derive(Clone, Debug)]
 pub struct CoverArt {
-    handle: CoverHandle,
+    pixels: Pixels,
     source: CoverSource,
     width: u32,
     height: u32,
@@ -83,9 +87,15 @@ pub struct CoverArt {
 }
 
 impl CoverArt {
-    /// The drawable handle. Clone it into a widget; the clone shares pixels.
-    pub fn handle(&self) -> &CoverHandle {
-        &self.handle
+    /// The drawable handle. Clones share pixels.
+    ///
+    /// A library cover evicted from memory returns a transparent pixel while it
+    /// reloads from the thumbnail cache, then the next frame draws it.
+    pub fn handle(&self) -> CoverHandle {
+        match &self.pixels {
+            Pixels::Resident(handle) => handle.clone(),
+            Pixels::Stored(stored) => stored.handle(),
+        }
     }
     /// Whether this art was embedded in the audio file or found beside it.
     pub fn source(&self) -> CoverSource {
@@ -109,12 +119,12 @@ impl CoverArt {
     /// Persist the already admitted thumbnail without decoding its source a
     /// second time. The scanner's cache file is always named `.jpg`.
     pub(crate) fn save_jpeg(&self, path: &Path) -> bool {
-        let CoverHandle::Rgba {
+        let Pixels::Resident(CoverHandle::Rgba {
             width,
             height,
             pixels,
             ..
-        } = &self.handle
+        }) = &self.pixels
         else {
             return false;
         };
@@ -169,7 +179,7 @@ pub fn decode_cover_within(
         _ => [[96, 96, 96]; 3],
     };
     Some(CoverArt {
-        handle,
+        pixels: Pixels::Resident(handle),
         source,
         width,
         height,
@@ -279,6 +289,299 @@ fn read_sidecar(path: &Path) -> io::Result<BoundedRead> {
     read_bounded(open_sidecar(path)?, COVER_DECODE_LIMITS.max_encoded_bytes)
 }
 
+/// Content identity of a library cover: a hash and byte length of its encoded
+/// image, and whether it was embedded or a sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CoverKey(u64, u64, CoverSource);
+
+impl CoverKey {
+    fn of_bytes(bytes: &[u8], source: CoverSource) -> Self {
+        Self(hash_bytes(bytes), bytes.len() as u64, source)
+    }
+
+    fn file_name(self) -> String {
+        let source = match self.2 {
+            CoverSource::Embedded => 'e',
+            CoverSource::Sidecar => 's',
+        };
+        format!("{:016x}-{:x}-{source}.jpg", self.0, self.1)
+    }
+}
+
+/// What a cached library cover needs to be drawn again without its source file.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CoverMeta {
+    key: CoverKey,
+    source: CoverSource,
+    width: u32,
+    height: u32,
+    palette: [[u8; 3]; 3],
+}
+
+impl CoverArt {
+    /// The persistent identity of a library cover held by the cover store.
+    pub fn meta(&self) -> Option<CoverMeta> {
+        match &self.pixels {
+            Pixels::Stored(stored) => Some(stored.meta),
+            Pixels::Resident(_) => None,
+        }
+    }
+
+    fn stored(stored: Arc<StoredCover>) -> Self {
+        let meta = stored.meta;
+        Self {
+            pixels: Pixels::Stored(stored),
+            source: meta.source,
+            width: meta.width,
+            height: meta.height,
+            palette: meta.palette,
+        }
+    }
+}
+
+/// Decoded library cover pixels kept in memory at once; the rest reload from
+/// the on-disk thumbnail cache when drawn.
+pub const COVER_RESIDENT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+enum Pixels {
+    Resident(CoverHandle),
+    Stored(Arc<StoredCover>),
+}
+
+struct StoredCover {
+    meta: CoverMeta,
+    slot: Mutex<Option<CoverHandle>>,
+    last_use: AtomicU64,
+    requested: AtomicBool,
+}
+
+impl std::fmt::Debug for StoredCover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCover")
+            .field("key", &self.meta.key)
+            .finish_non_exhaustive()
+    }
+}
+
+static TRANSPARENT: LazyLock<CoverHandle> =
+    LazyLock::new(|| CoverHandle::from_rgba(1, 1, vec![0; 4]));
+
+impl StoredCover {
+    fn new(meta: CoverMeta, handle: Option<CoverHandle>) -> Arc<Self> {
+        Arc::new(Self {
+            meta,
+            slot: Mutex::new(handle),
+            last_use: AtomicU64::new(STORE.tick()),
+            requested: AtomicBool::new(false),
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.meta.width as usize * self.meta.height as usize * 4
+    }
+
+    fn handle(self: &Arc<Self>) -> CoverHandle {
+        self.last_use.store(STORE.tick(), Ordering::Relaxed);
+        if let Some(handle) = lock(&self.slot).as_ref() {
+            return handle.clone();
+        }
+        STORE.request(self);
+        TRANSPARENT.clone()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[derive(Default)]
+struct StoreState {
+    known: HashMap<CoverKey, Weak<StoredCover>>,
+    resident: Vec<Weak<StoredCover>>,
+    queue: VecDeque<Arc<StoredCover>>,
+    loading: bool,
+}
+
+/// Process-wide library covers keyed by content, so every scan shares one
+/// decode per image and memory stays within [`COVER_RESIDENT_BYTES`].
+///
+/// Without a configured directory nothing can reload, so covers stay resident.
+struct CoverStore {
+    dir: OnceLock<PathBuf>,
+    state: Mutex<StoreState>,
+    clock: AtomicU64,
+    wake: Mutex<Option<iced::futures::channel::mpsc::UnboundedSender<()>>>,
+}
+
+static STORE: LazyLock<CoverStore> = LazyLock::new(|| CoverStore {
+    dir: OnceLock::new(),
+    state: Mutex::new(StoreState::default()),
+    clock: AtomicU64::new(1),
+    wake: Mutex::new(None),
+});
+
+/// Keep library cover thumbnails in `dir` so evicted covers can reload.
+pub fn configure_cover_store(dir: PathBuf) {
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = STORE.dir.set(dir);
+    }
+}
+
+/// Emits each time evicted covers finish reloading, so the UI redraws them.
+pub fn cover_reload_subscription() -> iced::Subscription<()> {
+    iced::Subscription::run(|| {
+        let (sender, receiver) = iced::futures::channel::mpsc::unbounded();
+        *lock(&STORE.wake) = Some(sender);
+        receiver
+    })
+}
+
+/// The cached cover described by `meta`, or `None` when its thumbnail is gone.
+pub fn revive_cover(meta: &CoverMeta) -> Option<CoverArt> {
+    if let Some(stored) = STORE.live(meta.key) {
+        return Some(CoverArt::stored(stored));
+    }
+    let dir = STORE.dir.get()?;
+    if !dir.join(meta.key.file_name()).is_file() {
+        return None;
+    }
+    let stored = StoredCover::new(*meta, None);
+    lock(&STORE.state)
+        .known
+        .insert(meta.key, Arc::downgrade(&stored));
+    Some(CoverArt::stored(stored))
+}
+
+impl CoverStore {
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn live(&self, key: CoverKey) -> Option<Arc<StoredCover>> {
+        lock(&self.state).known.get(&key)?.upgrade()
+    }
+
+    fn shared(&self, key: CoverKey) -> Option<CoverArt> {
+        self.live(key).map(CoverArt::stored)
+    }
+
+    // Writes the thumbnail once so the decoded pixels can later be evicted.
+    fn admit(&self, key: CoverKey, art: CoverArt) -> CoverArt {
+        let Some(dir) = self.dir.get() else {
+            return art;
+        };
+        let file = dir.join(key.file_name());
+        if !file.is_file() {
+            let staged = file.with_extension("part");
+            if !art.save_jpeg(&staged) || std::fs::rename(&staged, &file).is_err() {
+                let _ = std::fs::remove_file(&staged);
+                return art;
+            }
+        }
+        let Pixels::Resident(handle) = &art.pixels else {
+            return art;
+        };
+        let meta = CoverMeta {
+            key,
+            source: art.source,
+            width: art.width,
+            height: art.height,
+            palette: art.palette,
+        };
+        let stored = StoredCover::new(meta, Some(handle.clone()));
+        let mut state = lock(&self.state);
+        if state.known.len() >= 4096 && state.known.len().is_power_of_two() {
+            state.known.retain(|_, weak| weak.strong_count() > 0);
+        }
+        state.known.insert(key, Arc::downgrade(&stored));
+        state.resident.push(Arc::downgrade(&stored));
+        Self::evict(&mut state);
+        drop(state);
+        CoverArt::stored(stored)
+    }
+
+    fn evict(state: &mut StoreState) {
+        state.resident.retain(|weak| weak.strong_count() > 0);
+        let mut live: Vec<Arc<StoredCover>> =
+            state.resident.iter().filter_map(Weak::upgrade).collect();
+        let mut bytes: usize = live.iter().map(|stored| stored.bytes()).sum();
+        if bytes <= COVER_RESIDENT_BYTES {
+            return;
+        }
+        live.sort_by_key(|stored| stored.last_use.load(Ordering::Relaxed));
+        for stored in live {
+            if bytes <= COVER_RESIDENT_BYTES {
+                break;
+            }
+            bytes -= stored.bytes();
+            *lock(&stored.slot) = None;
+            stored.requested.store(false, Ordering::Relaxed);
+            state
+                .resident
+                .retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(&stored)));
+        }
+    }
+
+    fn request(&self, stored: &Arc<StoredCover>) {
+        if stored.requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut state = lock(&self.state);
+        state.queue.push_back(Arc::clone(stored));
+        if !state.loading {
+            state.loading = true;
+            if std::thread::Builder::new()
+                .name("music-cover-reload".into())
+                .spawn(|| STORE.reload_queued())
+                .is_err()
+            {
+                state.loading = false;
+            }
+        }
+    }
+
+    fn reload_queued(&self) {
+        loop {
+            let stored = {
+                let mut state = lock(&self.state);
+                match state.queue.pop_front() {
+                    Some(stored) => stored,
+                    None => {
+                        state.loading = false;
+                        break;
+                    }
+                }
+            };
+            // A cover no track holds any more is not worth decoding.
+            if Arc::strong_count(&stored) == 1 {
+                continue;
+            }
+            let decoded = self
+                .dir
+                .get()
+                .map(|dir| dir.join(stored.meta.key.file_name()))
+                .and_then(|file| read_sidecar(&file).ok())
+                .and_then(|bounded| bounded.bytes)
+                .and_then(|bytes| decode_cover(&bytes, stored.meta.source));
+            // A failed reload keeps `requested` set, so the cover stays a placeholder.
+            let Some(Pixels::Resident(handle)) = decoded.map(|art| art.pixels) else {
+                continue;
+            };
+            *lock(&stored.slot) = Some(handle);
+            let mut state = lock(&self.state);
+            state.resident.push(Arc::downgrade(&stored));
+            Self::evict(&mut state);
+            drop(state);
+            if let Some(wake) = lock(&self.wake).as_ref() {
+                let _ = wake.unbounded_send(());
+            }
+        }
+    }
+}
+
 /// Non-cryptographic hash used to recognise an already decoded cover. The
 /// cache also keys on byte length (see [`CoverCache::embedded`]).
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -315,8 +618,11 @@ impl CoverCache {
         if let Some(hit) = self.by_bytes.get(&key) {
             return hit.clone();
         }
-        self.decodes += 1;
-        let art = decode_cover(bytes, CoverSource::Embedded);
+        let store_key = CoverKey::of_bytes(bytes, CoverSource::Embedded);
+        let art = STORE.shared(store_key).or_else(|| {
+            self.decodes += 1;
+            decode_cover(bytes, CoverSource::Embedded).map(|art| STORE.admit(store_key, art))
+        });
         self.by_bytes.insert(key, art.clone());
         art
     }
@@ -335,9 +641,12 @@ impl CoverCache {
             self.last_sidecar_read_bytes =
                 read.as_ref().map_or(0, |bounded| bounded.retained_bytes);
         }
-        let art = read
-            .and_then(|bounded| bounded.bytes)
-            .and_then(|bytes| decode_cover(&bytes, CoverSource::Sidecar));
+        let art = read.and_then(|bounded| bounded.bytes).and_then(|bytes| {
+            let store_key = CoverKey::of_bytes(&bytes, CoverSource::Sidecar);
+            STORE.shared(store_key).or_else(|| {
+                decode_cover(&bytes, CoverSource::Sidecar).map(|art| STORE.admit(store_key, art))
+            })
+        });
         self.by_path.insert(path.to_path_buf(), art.clone());
         art
     }

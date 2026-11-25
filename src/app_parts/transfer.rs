@@ -375,11 +375,9 @@ impl MusicApp {
             return Task::none();
         }
         Task::batch(dispatches.into_iter().map(|dispatch| {
-            let task = self
-                .library_watch
-                .submit_scan(dispatch.root.clone(), dispatch.generation);
-            let root = dispatch.root;
+            let root = dispatch.root.clone();
             let generation = dispatch.generation;
+            let task = self.library_watch.submit_scan(dispatch);
             Task::perform(task, move |settlement| match settlement.into_result() {
                 Ok(scan) => Message::RootScanComplete(Box::new(scan)),
                 Err(_) => Message::RootScanFailed {
@@ -476,6 +474,7 @@ impl MusicApp {
         }
         use library_watch::ScanCompletion;
         let root = scan.root.clone();
+        let scope = scan.scope.clone();
         // Stamp from the single availability ordering source, not the watcher's
         // scan generation, so a later reconcile or backend outcome outranks it.
         let Some(generation) = self.next_availability_generation() else {
@@ -514,6 +513,9 @@ impl MusicApp {
                     .filter_map(|id| self.library.tracks.get(&id).map(|t| t.path.clone()))
                     .filter(|p| {
                         !present.contains(p)
+                            && scope
+                                .as_ref()
+                                .is_none_or(|dirs| dirs.iter().any(|dir| p.starts_with(dir)))
                             && !undecodable_set.contains(p.as_path())
                             && domain::owning_root(p, &folders) == Some(root.as_path())
                     })
@@ -530,8 +532,11 @@ impl MusicApp {
                 if merged_any {
                     self.mark_persistence_dirty();
                 }
-                self.library_watch
-                    .reconcile_watches(&root, &scan.directories);
+                self.library_watch.reconcile_scan_watches(
+                    &root,
+                    scope.as_deref(),
+                    &scan.directories,
+                );
             }
             ScanCompletion::Vanished => {
                 self.library_watch

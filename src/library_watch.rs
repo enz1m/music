@@ -19,10 +19,10 @@
 //! for removals; a vanished, refused, or partial scan never interprets absence
 //! as deletion.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use enzui_core::blocking_task::{BlockingTask, BlockingTaskOwner};
@@ -34,6 +34,7 @@ use iced::Subscription;
 
 use crate::art::CoverCache;
 use crate::domain::Track;
+use crate::scan_index::{Cached, FileStamp, ScanIndex};
 use crate::scanner;
 
 /// Debounce window applied to a delivery burst before a rescan is dispatched.
@@ -69,11 +70,28 @@ pub struct ScanLimits {
     pub max_duration: Duration,
 }
 
+impl ScanLimits {
+    /// Bounds for a user-requested rescan, which has no wall-clock budget so a
+    /// large library is indexed completely.
+    #[must_use]
+    pub fn manual() -> Self {
+        Self {
+            max_directories: 65_536,
+            max_path_bytes: 64 << 20,
+            max_files_visited: 1_000_000,
+            max_tracks: 400_000,
+            max_metadata_bytes: 256 << 20,
+            max_depth: 32,
+            max_duration: Duration::MAX,
+        }
+    }
+}
+
 impl Default for ScanLimits {
     fn default() -> Self {
         Self {
-            max_directories: 4096,
-            max_path_bytes: 1 << 20,
+            max_directories: 16_384,
+            max_path_bytes: 16 << 20,
             max_files_visited: 100_000,
             max_tracks: 50_000,
             max_metadata_bytes: 8 << 20,
@@ -139,6 +157,11 @@ pub struct RootScan {
     pub directories: Vec<PathBuf>,
     /// The typed completion.
     pub completion: ScanCompletion,
+    /// The subtrees traversed, or `None` for the whole root. A complete scan
+    /// is authoritative for removals only inside them.
+    pub scope: Option<Vec<PathBuf>>,
+    /// Files whose tags were read in this scan rather than reused unchanged.
+    pub probed: usize,
 }
 
 impl RootScan {
@@ -147,6 +170,27 @@ impl RootScan {
     pub fn is_complete(&self) -> bool {
         self.completion == ScanCompletion::Complete
     }
+
+    /// Whether `path` lies inside the traversed subtrees.
+    #[must_use]
+    pub fn covers(&self, path: &Path) -> bool {
+        self.scope
+            .as_ref()
+            .is_none_or(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
+    }
+}
+
+/// One scan the coordinator asks a provider to run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanRequest {
+    /// The configured root.
+    pub root: PathBuf,
+    /// The generation to stamp.
+    pub generation: u64,
+    /// Changed subtrees to rescan, or `None` for the whole root.
+    pub scope: Option<Vec<PathBuf>>,
+    /// A user-requested rescan, bounded by [`ScanLimits::manual`].
+    pub manual: bool,
 }
 
 fn metadata_bytes(track: &Track) -> usize {
@@ -173,6 +217,26 @@ pub fn scan_root_bounded(
     limits: &ScanLimits,
     is_cancelled: &dyn Fn() -> bool,
 ) -> RootScan {
+    scan_root_indexed(
+        root,
+        generation,
+        None,
+        limits,
+        &mut ScanIndex::ephemeral(),
+        is_cancelled,
+    )
+}
+
+/// [`scan_root_bounded`] over the subtrees in `scope`, reusing the tags of
+/// files whose modification time and size match `index`.
+pub fn scan_root_indexed(
+    root: &Path,
+    generation: u64,
+    scope: Option<&[PathBuf]>,
+    limits: &ScanLimits,
+    index: &mut ScanIndex,
+    is_cancelled: &dyn Fn() -> bool,
+) -> RootScan {
     let start = Instant::now();
     let mut tracks: Vec<Track> = Vec::new();
     let mut undecodable: Vec<PathBuf> = Vec::new();
@@ -181,14 +245,19 @@ pub fn scan_root_bounded(
     let mut path_bytes = 0usize;
     let mut meta_bytes = 0usize;
     let mut files_visited = 0usize;
+    let mut probed = 0usize;
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let scope = scope.and_then(|dirs| effective_scope(root, dirs));
 
-    let done = |root: &Path, tracks, undecodable, directories, completion| RootScan {
+    let done = |root: &Path, tracks, undecodable, directories, completion, probed| RootScan {
         root: root.to_path_buf(),
         generation,
         tracks,
         undecodable,
         directories,
         completion,
+        scope: scope.clone(),
+        probed,
     };
 
     let root_meta = match std::fs::symlink_metadata(root) {
@@ -200,6 +269,7 @@ pub fn scan_root_bounded(
                 undecodable,
                 directories,
                 ScanCompletion::Vanished,
+                probed,
             );
         }
     };
@@ -210,11 +280,23 @@ pub fn scan_root_bounded(
             undecodable,
             directories,
             ScanCompletion::Vanished,
+            probed,
         );
     }
     let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
-    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    let mut stack: Vec<(PathBuf, usize)> = match &scope {
+        None => vec![(root.to_path_buf(), 0)],
+        Some(dirs) => dirs
+            .iter()
+            .map(|dir| {
+                let depth = dir
+                    .strip_prefix(root)
+                    .map_or(0, |rel| rel.components().count());
+                (dir.clone(), depth)
+            })
+            .collect(),
+    };
     let mut completion = ScanCompletion::Complete;
 
     'outer: while let Some((dir, depth)) = stack.pop() {
@@ -314,7 +396,26 @@ pub fn scan_root_bounded(
                     completion = ScanCompletion::Refused(RefusalReason::Tracks);
                     break 'outer;
                 }
-                match scanner::scan_track_with_covers(&path, None, &mut covers) {
+                seen.insert(path.clone());
+                let stamp = std::fs::metadata(&path)
+                    .ok()
+                    .map(|meta| FileStamp::of(&meta));
+                let probe = match stamp.and_then(|stamp| index.lookup(&path, stamp)) {
+                    Some(Cached::Track(track)) => Ok(*track),
+                    Some(Cached::Undecodable) => Err(()),
+                    None => {
+                        probed += 1;
+                        let probe = scanner::scan_track_with_covers(&path, None, &mut covers);
+                        if let Some(stamp) = stamp {
+                            match &probe {
+                                Ok(track) => index.record_track(track, stamp),
+                                Err(_) => index.record_undecodable(&path, stamp),
+                            }
+                        }
+                        probe.map_err(drop)
+                    }
+                };
+                match probe {
                     Ok(track) => {
                         let cost = metadata_bytes(&track);
                         if meta_bytes.saturating_add(cost) > limits.max_metadata_bytes {
@@ -326,7 +427,7 @@ pub fn scan_root_bounded(
                     }
                     // A failed probe marks only this file `Undecodable`; the row
                     // survives a Complete reconcile.
-                    Err(_) => {
+                    Err(()) => {
                         undecodable.push(path.clone());
                     }
                 }
@@ -334,24 +435,91 @@ pub fn scan_root_bounded(
         }
     }
 
-    done(root, tracks, undecodable, directories, completion)
+    if completion == ScanCompletion::Complete {
+        let pruned = scope.clone().unwrap_or_else(|| vec![root.to_path_buf()]);
+        index.retain_seen(&pruned, &seen);
+    }
+    done(root, tracks, undecodable, directories, completion, probed)
+}
+
+// The outermost existing directories covering `dirs` below `root`, or `None`
+// when the whole root must be walked.
+fn effective_scope(root: &Path, dirs: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    let mut resolved: BTreeSet<PathBuf> = BTreeSet::new();
+    for dir in dirs {
+        let mut candidate = dir.as_path();
+        loop {
+            if !candidate.starts_with(root) || candidate == root {
+                return None;
+            }
+            let is_dir = std::fs::symlink_metadata(candidate).is_ok_and(|meta| meta.is_dir());
+            if is_dir {
+                break;
+            }
+            candidate = candidate.parent()?;
+        }
+        resolved.insert(candidate.to_path_buf());
+    }
+    let mut outermost: Vec<PathBuf> = Vec::new();
+    for dir in resolved {
+        if !outermost.iter().any(|kept| dir.starts_with(kept)) {
+            outermost.push(dir);
+        }
+    }
+    (!outermost.is_empty()).then_some(outermost)
 }
 
 /// Performs bounded root scans.
 pub trait RootScanProvider: Send + Sync + 'static {
-    /// Scan `root`, stamping the result with `generation`.
-    fn scan(&self, root: &Path, generation: u64, is_cancelled: &dyn Fn() -> bool) -> RootScan;
+    /// Run `request`, stamping the result with its generation.
+    fn scan(&self, request: &ScanRequest, is_cancelled: &dyn Fn() -> bool) -> RootScan;
 }
 
-/// Production provider: a real bounded filesystem walk.
-#[derive(Clone, Copy, Debug, Default)]
+/// Production provider: a real bounded filesystem walk over a scan index.
+#[derive(Default)]
 pub struct FilesystemScanProvider {
     limits: ScanLimits,
+    index_file: Option<PathBuf>,
+    // Loaded on the first scan so startup never reads it on the UI thread.
+    index: Mutex<Option<ScanIndex>>,
+}
+
+impl FilesystemScanProvider {
+    /// A provider whose index persists in `index_file`.
+    #[must_use]
+    pub fn persistent(index_file: PathBuf) -> Self {
+        Self {
+            index_file: Some(index_file),
+            ..Self::default()
+        }
+    }
 }
 
 impl RootScanProvider for FilesystemScanProvider {
-    fn scan(&self, root: &Path, generation: u64, is_cancelled: &dyn Fn() -> bool) -> RootScan {
-        scan_root_bounded(root, generation, &self.limits, is_cancelled)
+    fn scan(&self, request: &ScanRequest, is_cancelled: &dyn Fn() -> bool) -> RootScan {
+        let limits = if request.manual {
+            ScanLimits::manual()
+        } else {
+            self.limits
+        };
+        let mut guard = self
+            .index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = guard.get_or_insert_with(|| match &self.index_file {
+            Some(file) => ScanIndex::load(file.clone()),
+            None => ScanIndex::ephemeral(),
+        });
+        let scan = scan_root_indexed(
+            &request.root,
+            request.generation,
+            request.scope.as_deref(),
+            &limits,
+            index,
+            is_cancelled,
+        );
+        index.save_if_dirty();
+        scan
     }
 }
 
@@ -370,16 +538,41 @@ pub enum RootAvailability {
 }
 
 /// One dispatch the coordinator asks its owner to run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScanDispatch {
-    /// The root to scan.
-    pub root: PathBuf,
-    /// The generation to stamp.
-    pub generation: u64,
+pub type ScanDispatch = ScanRequest;
+
+// What the next scan of a root must cover.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum Pending {
+    #[default]
+    Nothing,
+    Dirs(BTreeSet<PathBuf>),
+    Root,
+}
+
+impl Pending {
+    fn merge(&mut self, other: Pending) {
+        *self = match (std::mem::take(self), other) {
+            (Pending::Root, _) | (_, Pending::Root) => Pending::Root,
+            (Pending::Dirs(mut dirs), Pending::Dirs(more)) => {
+                dirs.extend(more);
+                Pending::Dirs(dirs)
+            }
+            (Pending::Nothing, other) | (other, Pending::Nothing) => other,
+        };
+    }
+
+    fn of_scope(scope: Option<&[PathBuf]>) -> Self {
+        match scope {
+            None => Pending::Root,
+            Some(dirs) => Pending::Dirs(dirs.iter().cloned().collect()),
+        }
+    }
 }
 
 struct RootState {
     in_flight: Option<u64>,
+    in_flight_scope: Option<Vec<PathBuf>>,
+    pending: Pending,
     follow_up: bool,
     due_at: Option<Instant>,
     watches: Vec<(WatchId, PathBuf)>,
@@ -394,6 +587,8 @@ impl RootState {
     fn new() -> Self {
         Self {
             in_flight: None,
+            in_flight_scope: None,
+            pending: Pending::Root,
             follow_up: false,
             due_at: None,
             watches: Vec::new(),
@@ -453,7 +648,14 @@ impl LibraryWatcher {
     pub fn shipping() -> Self {
         let backend = default_backend();
         let owner = scan_owner();
-        Self::with_parts(backend, Arc::new(FilesystemScanProvider::default()), owner)
+        let provider = match cache_dir() {
+            Some(dir) => {
+                crate::art::configure_cover_store(dir.join("covers"));
+                FilesystemScanProvider::persistent(dir.join("library-index.json"))
+            }
+            None => FilesystemScanProvider::default(),
+        };
+        Self::with_parts(backend, Arc::new(provider), owner)
     }
 
     /// The event-driven directory-change subscription.
@@ -500,6 +702,7 @@ impl LibraryWatcher {
     /// root, one follow-up is armed instead of restarting it.
     pub fn register_root(&mut self, root: PathBuf, now: Instant) {
         let state = self.roots.entry(root).or_insert_with(RootState::new);
+        state.pending = Pending::Root;
         if state.in_flight.is_some() {
             state.follow_up = true;
         } else {
@@ -554,11 +757,12 @@ impl LibraryWatcher {
                 WatchOutcome::Changes(changes) => {
                     let significant = changes.iter().any(is_significant_change);
                     if significant {
-                        self.arm_rescan(&root, now);
+                        let dirs = BTreeSet::from([delivery.path.clone()]);
+                        self.arm_rescan(&root, Pending::Dirs(dirs), now);
                     }
                 }
                 WatchOutcome::Overflow => {
-                    self.arm_rescan(&root, now);
+                    self.arm_rescan(&root, Pending::Root, now);
                 }
                 WatchOutcome::Vanished => {
                     if let Some(state) = self.roots.get_mut(&root) {
@@ -576,10 +780,11 @@ impl LibraryWatcher {
         }
     }
 
-    fn arm_rescan(&mut self, root: &Path, now: Instant) {
+    fn arm_rescan(&mut self, root: &Path, scope: Pending, now: Instant) {
         let Some(state) = self.roots.get_mut(root) else {
             return;
         };
+        state.pending.merge(scope);
         if state.in_flight.is_some() {
             // One follow-up is armed for the whole in-flight window.
             state.follow_up = true;
@@ -608,9 +813,16 @@ impl LibraryWatcher {
             let generation = self.next_generation;
             self.next_generation = self.next_generation.wrapping_add(1);
             state.in_flight = Some(generation);
+            let scope = match std::mem::take(&mut state.pending) {
+                Pending::Dirs(dirs) => Some(dirs.into_iter().collect::<Vec<_>>()),
+                Pending::Nothing | Pending::Root => None,
+            };
+            state.in_flight_scope.clone_from(&scope);
             out.push(ScanDispatch {
                 root: root.clone(),
                 generation,
+                scope,
+                manual: state.manual,
             });
         }
         out
@@ -618,10 +830,10 @@ impl LibraryWatcher {
 
     /// Submit one scan to the bounded owner. The returned future settles once;
     /// dropping it cancels the generation but the running walk keeps its slot.
-    pub fn submit_scan(&self, root: PathBuf, generation: u64) -> BlockingTask<RootScan> {
+    pub fn submit_scan(&self, request: ScanRequest) -> BlockingTask<RootScan> {
         let provider = Arc::clone(&self.provider);
-        self.owner.submit(generation, move |ctx| {
-            provider.scan(&root, generation, &|| ctx.is_cancelled())
+        self.owner.submit(request.generation, move |ctx| {
+            provider.scan(&request, &|| ctx.is_cancelled())
         })
     }
 
@@ -638,6 +850,14 @@ impl LibraryWatcher {
             return false;
         }
         state.in_flight = None;
+        state.in_flight_scope = None;
+        // A scan cut by its time budget resumes; files it read are reused unchanged.
+        if scan.completion == ScanCompletion::Refused(RefusalReason::Duration) && scan.probed > 0 {
+            state
+                .pending
+                .merge(Pending::of_scope(scan.scope.as_deref()));
+            state.follow_up = true;
+        }
         if state.follow_up {
             state.follow_up = false;
             state.due_at = Some(now);
@@ -652,6 +872,8 @@ impl LibraryWatcher {
             && state.in_flight == Some(generation)
         {
             state.in_flight = None;
+            let scope = state.in_flight_scope.take();
+            state.pending.merge(Pending::of_scope(scope.as_deref()));
             state.due_at = Some(now + BUSY_RETRY);
         }
     }
@@ -755,6 +977,31 @@ impl LibraryWatcher {
         }
     }
 
+    /// Reconcile watches after a complete scan, keeping the watched directories
+    /// outside a scoped scan's subtrees.
+    pub fn reconcile_scan_watches(
+        &mut self,
+        root: &Path,
+        scope: Option<&[PathBuf]>,
+        directories: &[PathBuf],
+    ) {
+        let Some(scope) = scope else {
+            self.reconcile_watches(root, directories);
+            return;
+        };
+        let Some(state) = self.roots.get(root) else {
+            return;
+        };
+        let mut desired: Vec<PathBuf> = state
+            .last_safe_dirs
+            .iter()
+            .filter(|dir| !scope.iter().any(|scoped| dir.starts_with(scoped)))
+            .cloned()
+            .collect();
+        desired.extend(directories.iter().cloned());
+        self.reconcile_watches(root, &desired);
+    }
+
     /// Mark a root unavailable without purging its known tracks.
     pub fn mark_unavailable(&mut self, root: &Path, reason: impl Into<String>) {
         if let Some(state) = self.roots.get_mut(root) {
@@ -831,6 +1078,14 @@ pub fn default_backend() -> Arc<dyn DirectoryWatchBackend> {
     {
         Arc::new(enzui_core::file_tree_watch::NoopBackend)
     }
+}
+
+fn cache_dir() -> Option<PathBuf> {
+    let cache_home = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(cache_home.join("music-app"))
 }
 
 /// Build the bounded owner the scan walk runs on, degrading to an unavailable

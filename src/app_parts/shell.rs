@@ -123,6 +123,9 @@ impl MusicApp {
                 .subscription()
                 .map(Message::WatchDeliveries),
         );
+        // Evicted library covers redraw once they reload from the thumbnail cache.
+        subscriptions
+            .push(crate::art::cover_reload_subscription().map(|()| Message::LibraryWatchTick));
         // The watcher's own low-rate wake, armed only while a debounce or
         // busy-retry deadline is pending. A settled library installs no ticker.
         if self.library_watch.wants_tick() {
