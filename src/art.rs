@@ -13,12 +13,13 @@
 //! A file with no picture and no sidecar yields `None`, and views draw the
 //! themed placeholder rather than a stock image.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -318,6 +319,13 @@ pub struct CoverMeta {
     palette: [[u8; 3]; 3],
 }
 
+impl CoverMeta {
+    /// The content identity of the cached thumbnail.
+    pub fn key(&self) -> CoverKey {
+        self.key
+    }
+}
+
 impl CoverArt {
     /// The persistent identity of a library cover held by the cover store.
     pub fn meta(&self) -> Option<CoverMeta> {
@@ -445,9 +453,11 @@ pub fn revive_cover(meta: &CoverMeta) -> Option<CoverArt> {
         return Some(CoverArt::stored(stored));
     }
     let dir = STORE.dir.get()?;
-    if !dir.join(meta.key.file_name()).is_file() {
+    let file = dir.join(meta.key.file_name());
+    if !file.is_file() {
         return None;
     }
+    mark_used(&file);
     let stored = StoredCover::new(*meta, None);
     lock(&STORE.state)
         .known
@@ -464,6 +474,16 @@ impl CoverStore {
         lock(&self.state).known.get(&key)?.upgrade()
     }
 
+    fn loaded_file_names(&self) -> HashSet<String> {
+        let keys: Vec<CoverKey> = lock(&self.state)
+            .known
+            .iter()
+            .filter(|(_, weak)| weak.strong_count() > 0)
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter().map(CoverKey::file_name).collect()
+    }
+
     fn shared(&self, key: CoverKey) -> Option<CoverArt> {
         self.live(key).map(CoverArt::stored)
     }
@@ -474,7 +494,9 @@ impl CoverStore {
             return art;
         };
         let file = dir.join(key.file_name());
-        if !file.is_file() {
+        if file.is_file() {
+            mark_used(&file);
+        } else {
             let staged = file.with_extension("part");
             if !art.save_jpeg(&staged) || std::fs::rename(&staged, &file).is_err() {
                 let _ = std::fs::remove_file(&staged);
@@ -563,6 +585,7 @@ impl CoverStore {
                 .dir
                 .get()
                 .map(|dir| dir.join(stored.meta.key.file_name()))
+                .inspect(|file| mark_used(file))
                 .and_then(|file| read_sidecar(&file).ok())
                 .and_then(|bounded| bounded.bytes)
                 .and_then(|bytes| decode_cover(&bytes, stored.meta.source));
@@ -578,6 +601,118 @@ impl CoverStore {
             if let Some(wake) = lock(&self.wake).as_ref() {
                 let _ = wake.unbounded_send(());
             }
+        }
+    }
+}
+
+/// On-disk budget for library cover thumbnails.
+///
+/// A 256 px thumbnail is roughly 10 to 30 KB, so the budget holds several
+/// thousand albums. Covers the loaded library still holds are kept even past
+/// it, because evicted pixels reload from these files.
+pub const COVER_DISK_BYTES: u64 = 128 * 1024 * 1024;
+
+static PRUNING: AtomicBool = AtomicBool::new(false);
+
+// Thumbnail modification times order disk eviction; access times are often
+// not updated on `relatime` or `noatime` mounts.
+fn mark_used(file: &Path) {
+    if let Ok(handle) = OpenOptions::new().write(true).open(file) {
+        let _ = handle.set_modified(SystemTime::now());
+    }
+}
+
+/// Remove cached thumbnails that neither `referenced` nor a loaded cover
+/// names, then trim the least recently used ones to [`COVER_DISK_BYTES`].
+///
+/// Runs on its own thread and returns at once; a call while a prune is still
+/// running is skipped. Does nothing when no cover directory is configured.
+pub fn prune_cover_store(referenced: HashSet<CoverKey>) {
+    let Some(dir) = STORE.dir.get().cloned() else {
+        return;
+    };
+    if PRUNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let cutoff = SystemTime::now();
+    let spawned = std::thread::Builder::new()
+        .name("music-cover-prune".into())
+        .spawn(move || {
+            let referenced: HashSet<String> =
+                referenced.into_iter().map(CoverKey::file_name).collect();
+            prune_thumbnails(
+                &dir,
+                &referenced,
+                &|| STORE.loaded_file_names(),
+                cutoff,
+                COVER_DISK_BYTES,
+            );
+            PRUNING.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        PRUNING.store(false, Ordering::Release);
+    }
+}
+
+struct Thumbnail {
+    path: PathBuf,
+    name: String,
+    len: u64,
+    modified: SystemTime,
+}
+
+// Files changed at or after `cutoff` belong to work that started after the
+// prune was requested, so they are never removed.
+fn prune_thumbnails(
+    dir: &Path,
+    referenced: &HashSet<String>,
+    loaded: &dyn Fn() -> HashSet<String>,
+    cutoff: SystemTime,
+    budget: u64,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut total = 0u64;
+    let mut candidates: Vec<Thumbnail> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !meta.is_file() || !(name.ends_with(".jpg") || name.ends_with(".part")) {
+            continue;
+        }
+        total = total.saturating_add(meta.len());
+        let modified = meta.modified().unwrap_or(cutoff);
+        if modified < cutoff {
+            candidates.push(Thumbnail {
+                path: entry.path(),
+                name,
+                len: meta.len(),
+                modified,
+            });
+        }
+    }
+    let loaded = loaded();
+    candidates.retain(|thumbnail| !loaded.contains(&thumbnail.name));
+    candidates.sort_by_key(|thumbnail| thumbnail.modified);
+    let (orphans, in_use): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|thumbnail| !referenced.contains(&thumbnail.name));
+    for thumbnail in orphans {
+        if std::fs::remove_file(&thumbnail.path).is_ok() {
+            total = total.saturating_sub(thumbnail.len);
+        }
+    }
+    for thumbnail in in_use {
+        if total <= budget {
+            break;
+        }
+        if std::fs::remove_file(&thumbnail.path).is_ok() {
+            total = total.saturating_sub(thumbnail.len);
         }
     }
 }
@@ -655,6 +790,94 @@ impl CoverCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn thumbnail(dir: &Path, name: &str, len: usize, age_secs: u64) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+            .unwrap();
+        path
+    }
+
+    fn names(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn prune_removes_unreferenced_thumbnails_but_keeps_loaded_and_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let cutoff = SystemTime::now() - Duration::from_secs(10);
+        let referenced = thumbnail(dir.path(), "a-1-e.jpg", 100, 60);
+        let orphan = thumbnail(dir.path(), "b-1-e.jpg", 100, 60);
+        let loaded = thumbnail(dir.path(), "c-1-s.jpg", 100, 60);
+        let stale_part = thumbnail(dir.path(), "d-1-e.part", 100, 60);
+        let written_after_cutoff = thumbnail(dir.path(), "e-1-e.jpg", 100, 0);
+        let unrelated = thumbnail(dir.path(), "notes.txt", 100, 60);
+
+        prune_thumbnails(
+            dir.path(),
+            &names(&["a-1-e.jpg"]),
+            &|| names(&["c-1-s.jpg"]),
+            cutoff,
+            u64::MAX,
+        );
+
+        assert!(referenced.exists());
+        assert!(!orphan.exists());
+        assert!(loaded.exists());
+        assert!(!stale_part.exists());
+        assert!(written_after_cutoff.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn prune_evicts_least_recently_used_thumbnails_down_to_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cutoff = SystemTime::now();
+        let oldest = thumbnail(dir.path(), "a-1-e.jpg", 400, 400);
+        let older = thumbnail(dir.path(), "b-1-e.jpg", 400, 300);
+        let recent = thumbnail(dir.path(), "c-1-e.jpg", 400, 200);
+        let loaded_oldest = thumbnail(dir.path(), "d-1-e.jpg", 400, 900);
+        let referenced = names(&["a-1-e.jpg", "b-1-e.jpg", "c-1-e.jpg", "d-1-e.jpg"]);
+
+        prune_thumbnails(
+            dir.path(),
+            &referenced,
+            &|| names(&["d-1-e.jpg"]),
+            cutoff,
+            1_000,
+        );
+
+        assert!(!oldest.exists());
+        assert!(!older.exists());
+        assert!(recent.exists());
+        assert!(loaded_oldest.exists());
+    }
+
+    #[test]
+    fn using_a_thumbnail_makes_it_the_most_recent_for_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let cutoff = SystemTime::now() + Duration::from_secs(60);
+        let reused = thumbnail(dir.path(), "a-1-e.jpg", 400, 400);
+        let idle = thumbnail(dir.path(), "b-1-e.jpg", 400, 100);
+        mark_used(&reused);
+
+        prune_thumbnails(
+            dir.path(),
+            &names(&["a-1-e.jpg", "b-1-e.jpg"]),
+            &HashSet::new,
+            cutoff,
+            500,
+        );
+
+        assert!(reused.exists());
+        assert!(!idle.exists());
+    }
 
     #[test]
     fn a_3000_pixel_podcast_cover_decodes_to_a_thumbnail() {

@@ -519,6 +519,9 @@ impl RootScanProvider for FilesystemScanProvider {
             is_cancelled,
         );
         index.save_if_dirty();
+        if scan.completion == ScanCompletion::Complete && self.index_file.is_some() {
+            crate::art::prune_cover_store(index.cover_keys());
+        }
         scan
     }
 }

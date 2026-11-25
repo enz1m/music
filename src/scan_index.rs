@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::art::{CoverArt, CoverMeta};
+use crate::art::{CoverArt, CoverKey, CoverMeta};
 use crate::domain::{ReplayGain, Track};
 
 const FORMAT_VERSION: u32 = 1;
@@ -213,6 +213,17 @@ impl ScanIndex {
             seen.contains(path) || !scope.iter().any(|dir| path.starts_with(dir))
         });
         self.dirty |= self.entries.len() != before;
+    }
+
+    /// The cover thumbnails that indexed tracks reference.
+    pub fn cover_keys(&self) -> HashSet<CoverKey> {
+        self.entries
+            .values()
+            .filter_map(|(_, probe)| match probe {
+                Probe::Track(indexed) => indexed.cover.as_ref().map(CoverMeta::key),
+                Probe::Undecodable => None,
+            })
+            .collect()
     }
 
     /// Write the index to its file when it changed since the last save.
