@@ -43,8 +43,8 @@
         },
         {
           "type": "archive",
-          "url": "https://github.com/enz1m/music/releases/download/v0.2.1/music-cargo-vendor-0.2.1.tar.xz",
-          "sha256": "4d77dfda76bff0329804e16fb41cec51e6d57440361b5912bf23d981710d686d",
+          "url": "https://github.com/enz1m/music/releases/download/v0.2.2/music-cargo-vendor-0.2.2.tar.xz",
+          "sha256": "26f972b1bb7945395cd0919243855404bdb6ee1839893aa12133291a67df4ce1",
           "strip-components": 1
         },
         {
@@ -55,49 +55,49 @@
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/enz1m/enzui/46f267ecf6642423a7d716488200a5ceb8726655/vendor/gst-curl/curltask.h",
+          "url": "https://raw.githubusercontent.com/enz1m/enzui/46648f263fbfd31bb2a6327c4dda4845f8d5af97/vendor/gst-curl/curltask.h",
           "sha256": "7f1345be5a02f64e31c60c18c4efd7adff4a27707451ccbf136808d296cccbc8",
           "dest": "vendor/gst-curl"
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/enz1m/enzui/46f267ecf6642423a7d716488200a5ceb8726655/vendor/gst-curl/gstcurldefaults.h",
+          "url": "https://raw.githubusercontent.com/enz1m/enzui/46648f263fbfd31bb2a6327c4dda4845f8d5af97/vendor/gst-curl/gstcurldefaults.h",
           "sha256": "aa2f2b5d93dec5e4fa01f2bf7461d3bb5e172eb72353090a696769f2b1fbebb9",
           "dest": "vendor/gst-curl"
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/enz1m/enzui/46f267ecf6642423a7d716488200a5ceb8726655/vendor/gst-curl/gstcurlhttpsrc.c",
+          "url": "https://raw.githubusercontent.com/enz1m/enzui/46648f263fbfd31bb2a6327c4dda4845f8d5af97/vendor/gst-curl/gstcurlhttpsrc.c",
           "sha256": "981deb93767dd761e5a2f2f9e08341e5aa326763370e22010b8692715a90cc55",
           "dest": "vendor/gst-curl"
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/enz1m/enzui/46f267ecf6642423a7d716488200a5ceb8726655/vendor/gst-curl/gstcurlhttpsrc.h",
+          "url": "https://raw.githubusercontent.com/enz1m/enzui/46648f263fbfd31bb2a6327c4dda4845f8d5af97/vendor/gst-curl/gstcurlhttpsrc.h",
           "sha256": "939de61e58a61e1da2c59c90919f792c16daf95433cd84a7533f705d964026ef",
           "dest": "vendor/gst-curl"
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/enz1m/enzui/46f267ecf6642423a7d716488200a5ceb8726655/vendor/gst-curl/gstcurlqueue.c",
+          "url": "https://raw.githubusercontent.com/enz1m/enzui/46648f263fbfd31bb2a6327c4dda4845f8d5af97/vendor/gst-curl/gstcurlqueue.c",
           "sha256": "7969732900f1471c0bb97ee2b91be3a0e6574643e47b8dc70e774ce2b586d7fb",
           "dest": "vendor/gst-curl"
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/enz1m/enzui/46f267ecf6642423a7d716488200a5ceb8726655/vendor/gst-curl/gstcurlqueue.h",
+          "url": "https://raw.githubusercontent.com/enz1m/enzui/46648f263fbfd31bb2a6327c4dda4845f8d5af97/vendor/gst-curl/gstcurlqueue.h",
           "sha256": "79d4f47039fd10fcf6cd5df148ecfa5cec83bd96da8f59596f283c680d5a5452",
           "dest": "vendor/gst-curl"
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/enz1m/enzui/46f267ecf6642423a7d716488200a5ceb8726655/vendor/gst-curl/LICENSE-MIT",
+          "url": "https://raw.githubusercontent.com/enz1m/enzui/46648f263fbfd31bb2a6327c4dda4845f8d5af97/vendor/gst-curl/LICENSE-MIT",
           "sha256": "2d0aca3b536e1a2b45061c368cffe4a388aa75f3baa1dfc93636dba8945de78a",
           "dest": "vendor/gst-curl"
         },
         {
           "type": "file",
-          "url": "https://raw.githubusercontent.com/enz1m/enzui/46f267ecf6642423a7d716488200a5ceb8726655/vendor/gst-curl/UPSTREAM.json",
+          "url": "https://raw.githubusercontent.com/enz1m/enzui/46648f263fbfd31bb2a6327c4dda4845f8d5af97/vendor/gst-curl/UPSTREAM.json",
           "sha256": "10a2d7dec4d14f642a8c3840b56e958b9a7c676a9855bb9c60c35affbc5d79a2",
           "dest": "vendor/gst-curl"
         }

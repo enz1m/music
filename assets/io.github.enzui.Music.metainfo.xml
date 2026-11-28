@@ -43,6 +43,9 @@
   <url type="homepage">https://github.com/enz1m/music</url>
   <url type="bugtracker">https://github.com/enz1m/music/issues</url>
   <releases>
+    <release version="0.2.2" date="2026-11-28">
+      <description><p>Reuse unchanged files during library scans, limit cover art memory use, and require HTTPS throughout Soloist downloads.</p></description>
+    </release>
     <release version="0.2.1" date="2026-11-23">
       <description>
         <p>Switch between your library and playback views with smoother sidebar transitions and easier-to-find view controls.</p>
